@@ -144,6 +144,31 @@ jobs:
             --notes "Wordfence Production Feed mirror, $(date -u +%F)." \
             || gh release upload "$tag" "${assets[@]}" --clobber
 
+      - name: Sign release assets
+        if: steps.changed.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          tag="v$(date -u +%F)"
+          if [ -z "${MINISIGN_SECRET_KEY:-}" ]; then
+            echo "::warning::MINISIGN_SECRET_KEY is not set — publishing UNSIGNED artifacts"
+            exit 0
+          fi
+          go install github.com/Boreas37/onyx/cmd/onyx-minisign@main
+          SIGNER="$(go env GOPATH)/bin/onyx-minisign"
+          printf '%s' "$MINISIGN_SECRET_KEY" > work/key.sec
+          chmod 600 work/key.sec
+          sigs=()
+          for asset in wordfence-latest.json.gz deltas/delta-*.json.gz; do
+            [ -f "$asset" ] || continue
+            sig=$("$SIGNER" sign -s work/key.sec -m "$asset")
+            sigs+=("$sig")
+          done
+          rm -f work/key.sec
+          gh release upload "$tag" "${sigs[@]}" --clobber
+
       - name: Refresh manifest.json
         if: steps.changed.outputs.changed == 'true'
         env:
