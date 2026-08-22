@@ -1,0 +1,181 @@
+name: update
+
+# Daily mirror refresh: pull the newest Wordfence Intelligence production
+# feed, publish it as a release, generate onyx-delta-v1 changesets against
+# the last few published snapshots, and refresh manifest.json so `onyx
+# update` clients can patch incrementally.
+#
+# Requires the repository secret WORDFENCE_API_TOKEN (a Wordfence
+# Intelligence API key, supplied as a Bearer token).
+
+on:
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Restore feed bases cache
+        uses: actions/cache@v4
+        with:
+          path: bases
+          key: bases-${{ github.run_id }}
+          restore-keys: |
+            bases-
+
+      - name: Fetch latest production feed
+        id: fetch
+        env:
+          WF_TOKEN: ${{ secrets.WORDFENCE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p work deltas bases
+          if [ -z "${WF_TOKEN:-}" ]; then
+            echo "::error::WORDFENCE_API_TOKEN secret is not set. Add a Wordfence Intelligence API key as a repository secret."
+            exit 1
+          fi
+          code=$(curl -sS -o work/raw.bin -w '%{http_code}' \
+            -H "Authorization: Bearer $WF_TOKEN" \
+            -H "User-Agent: onyx-db-mirror" \
+            --max-time 600 \
+            "https://www.wordfence.com/api/intelligence/v3/vulnerabilities/production")
+          if [ "$code" != "200" ]; then
+            echo "::error::wordfence API returned HTTP $code"
+            exit 1
+          fi
+          # The API may answer with gzip or plain JSON; normalize to our
+          # canonical uncompressed snapshot either way.
+          if [ "$(head -c2 work/raw.bin | od -An -tx1 | tr -d ' \n')" = "1f8b" ]; then
+            gunzip -c work/raw.bin > work/new.json
+          else
+            cp work/raw.bin work/new.json
+          fi
+          echo "downloaded $(du -h work/new.json | cut -f1)"
+          sha_new_json=$(sha256sum work/new.json | awk '{print $1}')
+          echo "sha_json=$sha_new_json" >> "$GITHUB_OUTPUT"
+
+      - name: Check for changes
+        id: changed
+        env:
+          SHA_NEW: ${{ steps.fetch.outputs.sha_json }}
+        run: |
+          set -euo pipefail
+          sha_cur=$(zcat wordfence-latest.json.gz | sha256sum | awk '{print $1}')
+          if [ "$SHA_NEW" = "$sha_cur" ]; then
+            echo "Feed unchanged ($SHA_NEW) — nothing to do."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Feed changed: $sha_cur -> $SHA_NEW"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            # Seed today's base from the currently published artifact so
+            # day-one clients can always delta (bases hold the EXACT bytes
+            # of published release assets; from_sha256 keys off them).
+            cp wordfence-latest.json.gz "bases/$sha_cur.json.gz"
+          fi
+
+      - name: Generate deltas against recent bases
+        if: steps.changed.outputs.changed == 'true'
+        id: deltas
+        run: |
+          set -euo pipefail
+          go install github.com/Boreas37/onyx/cmd/onyx-deltagen@main
+          DELTAGEN="$(go env GOPATH)/bin/onyx-deltagen"
+          zcat wordfence-latest.json.gz > work/old.json
+          # Newest five bases only; older ones age out of the cache.
+          ls -1 bases/*.json.gz 2>/dev/null | tail -5 > work/baselist || true
+          : > work/delta-lines.ndjson
+          while read -r base_gz; do
+            [ -f "$base_gz" ] || continue
+            base_sha=$(basename "$base_gz" .json.gz)
+            zcat "$base_gz" > "work/base-$base_sha.json"
+            stats=$("$DELTAGEN" -old "work/base-$base_sha.json" -new work/new.json \
+              -out "deltas/delta-$base_sha.json.gz")
+            url="https://github.com/Boreas37/onyx-db/releases/download/v$(date -u +%F)/delta-$base_sha.json.gz"
+            jq -nc --arg sha "$base_sha" --arg path "$url" \
+              --argjson rec "$stats" \
+              '{from_sha256: $sha, path: $path,
+                records: {added: $rec.added, removed: $rec.removed,
+                          updated: $rec.updated, result: $rec.result_records}}' \
+              >> work/delta-lines.ndjson
+            rm -f "work/base-$base_sha.json"
+          done < work/baselist
+          echo "generated $(wc -l < work/delta-lines.ndjson) delta(s)"
+
+      - name: Publish release
+        if: steps.changed.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TZ: UTC
+        run: |
+          set -euo pipefail
+          tag="v$(date -u +%F)"
+          # Canonical artifact: deterministic gzip, this exact byte stream is
+          # what gets committed, uploaded and cached as a base.
+          gzip -9 -n -c work/new.json > wordfence-latest.json.gz
+          assets=(wordfence-latest.json.gz)
+          for d in deltas/delta-*.json.gz; do
+            [ -f "$d" ] && assets+=("$d")
+          done
+          gh release create "$tag" "${assets[@]}" \
+            --title "DB $(date -u +%F)" \
+            --notes "Wordfence Production Feed mirror, $(date -u +%F)." \
+            || gh release upload "$tag" "${assets[@]}" --clobber
+
+      - name: Refresh manifest.json
+        if: steps.changed.outputs.changed == 'true'
+        env:
+          SHA_JSON: ${{ steps.fetch.outputs.sha_json }}
+        run: |
+          set -euo pipefail
+          tag="v$(date -u +%F)"
+          gz_sha=$(sha256sum wordfence-latest.json.gz | awk '{print $1}')
+          gz_size=$(stat -c%s wordfence-latest.json.gz)
+          full_url="https://github.com/Boreas37/onyx-db/releases/download/$tag/wordfence-latest.json.gz"
+          # Keep at most five delta entries: today's first, then previous ones.
+          prev_deltas=""
+          if [ -f manifest.json ]; then
+            prev_deltas=$(jq -c '.deltas[0:4] // []' manifest.json)
+          fi
+          jq -nc \
+            --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg sha "$gz_sha" --argjson size "$gz_size" --arg fpath "$full_url" \
+            --slurpfile today <(jq -s '.' work/delta-lines.ndjson) \
+            --argjson prev "$prev_deltas" \
+            '{generated_at: $now,
+              full: {sha256: $sha, size: $size, path: $fpath},
+              deltas: ($today[0] + $prev)}' > manifest.json
+          jq . manifest.json > /dev/null   # sanity: must be valid JSON
+          cat manifest.json
+
+      - name: Save new base and prune old ones
+        if: steps.changed.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          cp wordfence-latest.json.gz "bases/${{ steps.fetch.outputs.sha_json }}.json.gz"
+          ls -1t bases/*.json.gz 2>/dev/null | tail -n +6 | xargs -r rm -f
+          ls -lh bases/
+
+      - name: Commit refreshed mirror
+        if: steps.changed.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          git config user.name "onyx-db bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add wordfence-latest.json.gz manifest.json
+          git commit -m "mirror: Wordfence Production Feed $(date -u +%F) ($(du -h wordfence-latest.json.gz | cut -f1) gz)"
+          git push
