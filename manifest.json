@@ -1,9 +1,1 @@
-{
-  "generated_at": "2026-08-22T15:10:00Z",
-  "full": {
-    "sha256": "75ab6eb555d3bb4e10f27e53a6829e47d8e348dde9e955ab9d005c9f338a4ae0",
-    "size": 11832120,
-    "path": "https://github.com/Boreas37/onyx-db/releases/download/v2026-08-16/wordfence-latest.json.gz"
-  },
-  "deltas": []
-}
+{"generated_at":"2026-08-22T15:29:06Z","full":{"sha256":"29121ef36b259de2e27f4e9bea36321d77773a3a7ec54622ad4f1429efce7bf5","size":11644472,"path":"https://github.com/Boreas37/onyx-db/releases/download/v2026-08-22/wordfence-latest.json.gz"},"deltas":[{"from_sha256":"18a9022d160a42e619df1cca0faf12fe764e652ee924b1d7994c4201ef9bf4ac","path":"https://github.com/Boreas37/onyx-db/releases/download/v2026-08-22/delta-18a9022d160a42e619df1cca0faf12fe764e652ee924b1d7994c4201ef9bf4ac.json.gz","records":{"added":282,"removed":0,"updated":349,"result":39166}}]}
