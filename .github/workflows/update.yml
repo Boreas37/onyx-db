@@ -82,10 +82,15 @@ jobs:
           else
             echo "Feed changed: $sha_cur -> $SHA_NEW"
             echo "changed=true" >> "$GITHUB_OUTPUT"
-            # Seed today's base from the currently published artifact so
-            # day-one clients can always delta (bases hold the EXACT bytes
-            # of published release assets; from_sha256 keys off them).
-            cp wordfence-latest.json.gz "bases/$sha_cur.json.gz"
+            # Seed today's base from the currently published artifact.
+            # IMPORTANT hash domains: onyx clients store the sha256 of the
+            # GZIPPED artifact they downloaded (raw bytes), and look delta
+            # entries up by that value. Base files (and manifest keys)
+            # therefore must be named by the artifact's COMPRESSED sha —
+            # deltagen independently stamps the decompressed content sha
+            # inside the delta header, which is what ApplyDelta checks.
+            gz_cur=$(sha256sum wordfence-latest.json.gz | awk '{print $1}')
+            cp wordfence-latest.json.gz "bases/$gz_cur.json.gz"
           fi
 
       - name: Generate deltas against recent bases
@@ -101,9 +106,12 @@ jobs:
           : > work/delta-lines.ndjson
           while read -r base_gz; do
             [ -f "$base_gz" ] || continue
-            base_sha=$(basename "$base_gz" .json.gz)
-            zcat "$base_gz" > "work/base-$base_sha.json"
-            stats=$("$DELTAGEN" -old "work/base-$base_sha.json" -new work/new.json \
+            # Key = sha256 of the base ARTIFACT bytes (what clients stored
+            # after downloading it), computed here rather than trusted from
+            # the filename so legacy cache entries keep working.
+            base_sha=$(sha256sum "$base_gz" | awk '{print $1}')
+            zcat "$base_gz" > "work/base.json"
+            stats=$("$DELTAGEN" -old work/base.json -new work/new.json \
               -out "deltas/delta-$base_sha.json.gz")
             url="https://github.com/Boreas37/onyx-db/releases/download/v$(date -u +%F)/delta-$base_sha.json.gz"
             jq -nc --arg sha "$base_sha" --arg path "$url" \
@@ -112,7 +120,7 @@ jobs:
                 records: {added: $rec.added, removed: $rec.removed,
                           updated: $rec.updated, result: $rec.result_records}}' \
               >> work/delta-lines.ndjson
-            rm -f "work/base-$base_sha.json"
+            rm -f work/base.json
           done < work/baselist
           echo "generated $(wc -l < work/delta-lines.ndjson) delta(s)"
 
@@ -166,7 +174,9 @@ jobs:
         if: steps.changed.outputs.changed == 'true'
         run: |
           set -euo pipefail
-          cp wordfence-latest.json.gz "bases/${{ steps.fetch.outputs.sha_json }}.json.gz"
+          # Key by the COMPRESSED artifact sha — the value clients hold in
+          # their .sha256 sidecar and match manifest deltas against.
+          cp wordfence-latest.json.gz "bases/$(sha256sum wordfence-latest.json.gz | awk '{print $1}').json.gz"
           ls -1t bases/*.json.gz 2>/dev/null | tail -n +6 | xargs -r rm -f
           ls -lh bases/
 
