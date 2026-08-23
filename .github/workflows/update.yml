@@ -179,10 +179,14 @@ jobs:
           gz_sha=$(sha256sum wordfence-latest.json.gz | awk '{print $1}')
           gz_size=$(stat -c%s wordfence-latest.json.gz)
           full_url="https://github.com/Boreas37/onyx-db/releases/download/$tag/wordfence-latest.json.gz"
-          # Keep at most five delta entries: today's first, then previous ones.
-          prev_deltas=""
+          # Keep at most five delta entries, de-duplicated by from_sha256:
+          # today's lines come first (newest wins), then previous-manifest
+          # entries that are not already covered. Without the union/dedupe,
+          # reruns or overlapping retention windows published the same
+          # from_sha256 twice.
+          prev_deltas="[]"
           if [ -f manifest.json ]; then
-            prev_deltas=$(jq -c '.deltas[0:4] // []' manifest.json)
+            prev_deltas=$(jq -c '.deltas // []' manifest.json)
           fi
           jq -nc \
             --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -191,7 +195,11 @@ jobs:
             --argjson prev "$prev_deltas" \
             '{generated_at: $now,
               full: {sha256: $sha, size: $size, path: $fpath},
-              deltas: ($today[0] + $prev)}' > manifest.json
+              deltas: (($today[0] + $prev)
+                       | reduce .[] as $d ([];
+                           if any(.[]; .from_sha256 == $d.from_sha256) then .
+                           else . + [$d] end)
+                       | .[0:5])}' > manifest.json
           jq . manifest.json > /dev/null   # sanity: must be valid JSON
           cat manifest.json
 
