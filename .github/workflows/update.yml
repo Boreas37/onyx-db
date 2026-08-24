@@ -203,6 +203,29 @@ jobs:
           jq . manifest.json > /dev/null   # sanity: must be valid JSON
           cat manifest.json
 
+      - name: Sign manifest.json
+        # Runs after Refresh manifest.json so the freshly written document
+        # is signed, not yesterday's. Mirrors the "Sign release assets"
+        # step: same onyx-minisign binary and MINISIGN_SECRET_KEY, graceful
+        # warning when the secret is unset. The signature is committed next
+        # to manifest.json so clients can authenticate the document itself
+        # (manifest.json.minisig) rather than only the release artifacts.
+        if: steps.changed.outputs.changed == 'true'
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${MINISIGN_SECRET_KEY:-}" ]; then
+            echo "::warning::MINISIGN_SECRET_KEY is not set — manifest.json published UNSIGNED"
+            exit 0
+          fi
+          go install github.com/Boreas37/onyx/cmd/onyx-minisign@main
+          SIGNER="$(go env GOPATH)/bin/onyx-minisign"
+          printf '%s' "$MINISIGN_SECRET_KEY" > work/key.sec
+          chmod 600 work/key.sec
+          "$SIGNER" sign -s work/key.sec -m manifest.json
+          rm -f work/key.sec
+
       - name: Save new base and prune old ones
         if: steps.changed.outputs.changed == 'true'
         run: |
@@ -219,6 +242,6 @@ jobs:
           set -euo pipefail
           git config user.name "onyx-db bot"
           git config user.email "actions@users.noreply.github.com"
-          git add wordfence-latest.json.gz manifest.json
+          git add wordfence-latest.json.gz manifest.json manifest.json.minisig
           git commit -m "mirror: Wordfence Production Feed $(date -u +%F) ($(du -h wordfence-latest.json.gz | cut -f1) gz)"
           git push
