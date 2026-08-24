@@ -93,6 +93,21 @@ jobs:
             cp wordfence-latest.json.gz "bases/$gz_cur.json.gz"
           fi
 
+      - name: Generate popular.json
+        # Optional enrichment asset: the top WordPress.org plugin/theme
+        # slugs for offline scan enrichment. Never fails the release — when
+        # wordpress.org is unreachable we warn and publish without it.
+        if: steps.changed.outputs.changed == 'true'
+        run: |
+          set -uo pipefail
+          if ! python3 scripts/gen_popular.py work/popular.json; then
+            echo "::warning::popular.json generation failed — publishing release WITHOUT the popular asset"
+            rm -f work/popular.json popular.json.gz
+            exit 0
+          fi
+          gzip -9 -n -c work/popular.json > popular.json.gz
+          echo "popular asset: $(sha256sum popular.json.gz | awk '{print $1}')"
+
       - name: Generate deltas against recent bases
         if: steps.changed.outputs.changed == 'true'
         id: deltas
@@ -136,6 +151,7 @@ jobs:
           # what gets committed, uploaded and cached as a base.
           gzip -9 -n -c work/new.json > wordfence-latest.json.gz
           assets=(wordfence-latest.json.gz)
+          [ -f popular.json.gz ] && assets+=(popular.json.gz)
           for d in deltas/delta-*.json.gz; do
             [ -f "$d" ] && assets+=("$d")
           done
@@ -161,7 +177,7 @@ jobs:
           printf '%s' "$MINISIGN_SECRET_KEY" > work/key.sec
           chmod 600 work/key.sec
           sigs=()
-          for asset in wordfence-latest.json.gz deltas/delta-*.json.gz; do
+          for asset in wordfence-latest.json.gz popular.json.gz deltas/delta-*.json.gz; do
             [ -f "$asset" ] || continue
             sig=$("$SIGNER" sign -s work/key.sec -m "$asset")
             sigs+=("$sig")
@@ -188,18 +204,31 @@ jobs:
           if [ -f manifest.json ]; then
             prev_deltas=$(jq -c '.deltas // []' manifest.json)
           fi
+          # Optional top-level "popular" entry; when the popular asset was
+          # not generated (wordpress.org unreachable) the key is omitted so
+          # clients treat it as "not available".
+          popular_arg='null'
+          if [ -f popular.json.gz ]; then
+            pop_sha=$(sha256sum popular.json.gz | awk '{print $1}')
+            pop_size=$(stat -c%s popular.json.gz)
+            pop_url="https://github.com/Boreas37/onyx-db/releases/download/$tag/popular.json.gz"
+            popular_arg=$(jq -nc --arg sha "$pop_sha" --argjson size "$pop_size" --arg path "$pop_url" \
+              '{sha256: $sha, size: $size, path: $path}')
+          fi
           jq -nc \
             --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --arg sha "$gz_sha" --argjson size "$gz_size" --arg fpath "$full_url" \
             --slurpfile today <(jq -s '.' work/delta-lines.ndjson) \
             --argjson prev "$prev_deltas" \
+            --argjson popular "$popular_arg" \
             '{generated_at: $now,
               full: {sha256: $sha, size: $size, path: $fpath},
               deltas: (($today[0] + $prev)
                        | reduce .[] as $d ([];
                            if any(.[]; .from_sha256 == $d.from_sha256) then .
                            else . + [$d] end)
-                       | .[0:5])}' > manifest.json
+                       | .[0:5])}
+             + (if $popular then {popular: $popular} else {} end)' > manifest.json
           jq . manifest.json > /dev/null   # sanity: must be valid JSON
           cat manifest.json
 

@@ -26,6 +26,68 @@ the data — the scanner code is the project's own contribution.
 
 - `wordfence-latest.json.gz` — gzip-compressed Wordfence Production Feed
   (~11.8MB compressed / ~151MB raw, ~38,800+ vulnerability records)
+- `manifest.json` — update manifest advertising the full snapshot and recent
+  deltas (plus the optional `popular` entry), consumed by `onyx update`
+
+## Optional enrichment assets
+
+Besides the vulnerability feed, the mirror publishes two **optional** assets
+for offline scan enrichment. They are advertised separately from the feed and
+are never required: clients must degrade gracefully (skip the feature) when
+they are absent from a release or from the manifest.
+
+### `popular.json.gz` (daily)
+
+The most popular WordPress.org plugins and themes, refreshed on every daily
+release. Shape:
+
+```json
+{
+  "plugins": ["akismet", "contact-form-7", "..."],
+  "themes":  ["twentytwentyfive", "generatepress", "..."]
+}
+```
+
+- Slug arrays are lowercase, deduplicated, ordered by popularity descending,
+  capped at 500 plugins / 100 themes (the wordpress.org API may return fewer).
+- Built from `https://api.wordpress.org/plugins/info/1.2/` and
+  `https://api.wordpress.org/themes/info/1.2/` (`browse=popular`).
+- Deterministic `gzip -9 -n`; signed with the same onyx-minisign key as the
+  feed (verify with `ONYX_DB_PUBKEY`).
+- Advertised in `manifest.json` under the optional top-level `popular` field:
+  `{"popular": {"sha256": "<hex>", "size": N, "path": "<release>/popular.json.gz"}}`.
+  If the wordpress.org API is unreachable the daily release still goes out —
+  the `popular` key is simply omitted, which clients read as "not available".
+
+### `fingerprints.json.gz` (weekly + manual dispatch)
+
+A WordPress core asset fingerprint table for onyx's `--fingerprint-db`,
+built by the `fingerprints` workflow (weekly schedule + `workflow_dispatch`).
+Shape:
+
+```json
+{
+  "files": {
+    "wp-includes/js/wp-emoji-release.min.js": {
+      "<md5hex>": ["7.1", "7.0"]
+    }
+  }
+}
+```
+
+- Covers the last 6 stable WordPress versions (current + 5 previous) and
+  four stable static core files (`wp-includes/js/wp-emoji-release.min.js`,
+  `wp-includes/js/wp-embed.min.js`, `wp-includes/js/wp-util.min.js`,
+  `wp-admin/js/common.min.js`) fetched from
+  `https://core.svn.wordpress.org/tags/<version>/`.
+- Each file path maps md5 hex digests onto the versions carrying them,
+  newest version first (clients take the first listed). Files that do not
+  exist in a version (404) are simply skipped.
+- Deterministic `gzip -9 -n`; signed with the same onyx-minisign key
+  (verify with `ONYX_DB_PUBKEY`).
+- Published onto the latest daily `v<date>` release when one exists,
+  otherwise on a standalone `fingerprints-<date>` release. All failures are
+  soft: a failed build warns and publishes nothing; clients are unaffected.
 
 ## Updating
 

@@ -1,0 +1,114 @@
+name: fingerprints
+
+# Optional enrichment asset: the WordPress core fingerprint table
+# (fingerprints.json.gz) used by onyx's --fingerprint-db. Builds weekly and
+# on manual dispatch, then publishes the asset onto the LATEST daily mirror
+# release (v<date>) when one exists, else onto a standalone
+# fingerprints-<date> release. Signs it with the same onyx-minisign key as
+# the daily mirror so clients can verify with ONYX_DB_PUBKEY.
+#
+# All failures here are soft: warn and exit 0, publish nothing.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 4 * * 1"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fingerprints
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      url: ${{ steps.publish.outputs.url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Generate fingerprints.json
+        id: gen
+        run: |
+          set -uo pipefail
+          if ! python3 scripts/gen_fingerprints.py work/fingerprints.json; then
+            echo "::warning::fingerprints.json generation failed — no fingerprints asset this run"
+            echo "failed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          gzip -9 -n -c work/fingerprints.json > fingerprints.json.gz
+          echo "generated fingerprints.json.gz ($(du -h fingerprints.json.gz | cut -f1))"
+          echo "failed=false" >> "$GITHUB_OUTPUT"
+
+      - name: Sign fingerprints.json.gz
+        if: steps.gen.outputs.failed == 'false'
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          set -uo pipefail
+          if [ -z "${MINISIGN_SECRET_KEY:-}" ]; then
+            echo "::warning::MINISIGN_SECRET_KEY is not set — fingerprints asset published UNSIGNED"
+            exit 0
+          fi
+          go install github.com/Boreas37/onyx/cmd/onyx-minisign@main
+          SIGNER="$(go env GOPATH)/bin/onyx-minisign"
+          printf '%s' "$MINISIGN_SECRET_KEY" > work/key.sec
+          chmod 600 work/key.sec
+          sig=$("$SIGNER" sign -s work/key.sec -m fingerprints.json.gz)
+          echo "signed: $sig"
+          rm -f work/key.sec
+
+      - name: Publish fingerprints asset
+        if: steps.gen.outputs.failed == 'false'
+        id: publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          # Target the latest daily v<date> release if one exists, else make
+          # a standalone release. Releases are vYYYY-MM-DD so -r sort works.
+          tag=$(gh release list --limit 50 --json tagName --jq '.[].tagName' \
+            | grep -E '^v[0-9]{4}-[0-9]{2}-[0-9]{2}$' | sort -r | head -1 || true)
+          if [ -n "$tag" ]; then
+            if ! gh release upload "$tag" fingerprints.json.gz --clobber; then
+              echo "::warning::failed to upload fingerprints asset to $tag"
+              exit 0
+            fi
+            url="https://github.com/Boreas37/onyx-db/releases/download/$tag/fingerprints.json.gz"
+            echo "attached fingerprints asset to latest daily release $tag"
+          else
+            tag="fingerprints-$(date -u +%F)"
+            if ! gh release create "$tag" fingerprints.json.gz \
+                --title "WordPress core fingerprints $(date -u +%F)" \
+                --notes "Core asset md5 fingerprint table for onyx --fingerprint-db, $(date -u +%F)."; then
+              if ! gh release upload "$tag" fingerprints.json.gz --clobber; then
+                echo "::warning::failed to create/upload standalone fingerprints release $tag"
+                exit 0
+              fi
+            fi
+            url="https://github.com/Boreas37/onyx-db/releases/download/$tag/fingerprints.json.gz"
+            echo "created standalone fingerprints release $tag"
+          fi
+          if [ -f fingerprints.json.gz.minisig ]; then
+            gh release upload "$tag" fingerprints.json.gz.minisig --clobber || \
+              echo "::warning::failed to upload fingerprints minisig"
+          fi
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Report fingerprint asset URL
+        if: always()
+        env:
+          URL: ${{ steps.publish.outputs.url }}
+        run: |
+          echo "## WordPress core fingerprints asset" >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "${URL:-}" ]; then
+            echo "Published: $URL" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No fingerprints asset published this run (generation failed or skipped)." >> "$GITHUB_STEP_SUMMARY"
+          fi
