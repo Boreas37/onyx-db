@@ -44,12 +44,21 @@ release. Shape:
 ```json
 {
   "plugins": ["akismet", "contact-form-7", "..."],
-  "themes":  ["twentytwentyfive", "generatepress", "..."]
+  "themes":  ["twentytwentyfive", "generatepress", "..."],
+  "counts_plugins": {"akismet": 5000000, "contact-form-7": 4000000, "..."},
+  "counts_themes":  {"twentytwentyfive": 3000000, "generatepress": 2000000, "..."}
 }
 ```
 
 - Slug arrays are lowercase, deduplicated, ordered by popularity descending,
   capped at 500 plugins / 100 themes (the wordpress.org API may return fewer).
+- `counts_plugins` / `counts_themes` map each slug to its wordpress.org
+  `active_installs` figure (integer >= 0), covering exactly the slugs that
+  made the list. If the API omits `active_installs` for an item the slug stays
+  in the list with a count of `0`.
+- Both counts maps are **optional**: clients that do not need install counts
+  ignore them, and absence of the keys means "no counts available" (older
+  releases / clients degrade gracefully).
 - Built from `https://api.wordpress.org/plugins/info/1.2/` and
   `https://api.wordpress.org/themes/info/1.2/` (`browse=popular`).
 - Deterministic `gzip -9 -n`; signed with the same onyx-minisign key as the
